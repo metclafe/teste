@@ -1,6 +1,16 @@
 const fs = require('fs');
 const path = require('path');
 
+// Cache do api.js em memória — lê do disco uma vez só
+let apiJsCache: Buffer | null = null;
+function getApiJs(): Buffer | null {
+    if (apiJsCache) return apiJsCache;
+    try {
+        apiJsCache = fs.readFileSync(path.join(__dirname, '../js/api.js'));
+        return apiJsCache;
+    } catch { return null; }
+}
+
 interface TurnstileData {
     domain: string;
     siteKey: string;
@@ -64,16 +74,14 @@ async function turnstile({ domain, proxy, siteKey, userAgent }: TurnstileData, p
             } else if (reqUrl.includes("challenges.cloudflare.com/reports/v0/post")) {
                 await request.abort();
             } else if (reqUrl.includes("challenges.cloudflare.com/turnstile/v0/b/88d68f5d5ea3/api.js")) {
-                const localPath = path.join(__dirname, '../js/api.js');
-                try {
-                    const body = fs.readFileSync(localPath);
+                const body = getApiJs();
+                if (body) {
                     await request.respond({
                         status: 200,
                         contentType: 'application/javascript',
                         body: body
                     });
-                } catch (e) {
-                    console.error("Failed to serve local api.js:", e);
+                } else {
                     await request.continue();
                 }
             } else if (

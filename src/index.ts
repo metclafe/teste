@@ -7,134 +7,129 @@ const app = express();
 const port = process.env.PORT || 8742;
 const authToken = process.env.authToken || null;
 
-(global as any).browserLimit = Number(process.env.browserLimit) || 20;
-// 3 min default so captcha has time to resolve; use env timeOut or request body timeOut to override
+const MAX_CONCURRENT = Number(process.env.browserLimit) || 20;
+const MAX_QUEUE = Number(process.env.maxQueue) || 50;
+// 3 min default so captcha has time to resolve
 (global as any).timeOut = Number(process.env.timeOut) || 180000;
 
 const CACHE_TTL = 30 * 60 * 1000;
 
-interface CacheEntry {
-    expireAt: number;
-    value: any;
-}
+// ============================================================
+// Concurrency control — semáforo ao invés de variável global mutável
+// ============================================================
+let activeCount = 0;
+const waitQueue: Array<(value: void) => void> = [];
 
-interface Cache {
-    [key: string]: CacheEntry;
-}
-
-const memoryCache: Cache = {};
-
-async function readCache(key: string): Promise<any> {
-    const entry = memoryCache[key];
-    if (entry && Date.now() < entry.expireAt) {
-        return entry.value;
+function acquireSlot(): Promise<void> {
+    if (activeCount < MAX_CONCURRENT) {
+        activeCount++;
+        return Promise.resolve();
     }
+    if (waitQueue.length >= MAX_QUEUE) {
+        return Promise.reject(new Error("queue_full"));
+    }
+    return new Promise(resolve => waitQueue.push(resolve));
+}
+
+function releaseSlot() {
+    if (waitQueue.length > 0) {
+        const next = waitQueue.shift()!;
+        next();
+    } else {
+        activeCount--;
+    }
+}
+
+// ============================================================
+// Cache com cleanup automático
+// ============================================================
+interface CacheEntry { expireAt: number; value: any; }
+const memoryCache: Record<string, CacheEntry> = {};
+
+function readCache(key: string): any {
+    const entry = memoryCache[key];
+    if (entry && Date.now() < entry.expireAt) return entry.value;
+    if (entry) delete memoryCache[key];
     return null;
 }
 
-async function writeCache(key: string, value: any, ttl: number = CACHE_TTL) {
+function writeCache(key: string, value: any, ttl: number = CACHE_TTL) {
     memoryCache[key] = { expireAt: Date.now() + ttl, value };
 }
 
-// Limpa entradas expiradas a cada 5 min para não vazar memória
 setInterval(() => {
     const now = Date.now();
     for (const key in memoryCache) {
-        if (memoryCache[key].expireAt <= now) {
-            delete memoryCache[key];
-        }
+        if (memoryCache[key].expireAt <= now) delete memoryCache[key];
     }
 }, 5 * 60 * 1000);
 
+// ============================================================
+// Express setup
+// ============================================================
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-let server = app.listen(port, async () => {
-    console.log(`Server running on port ${port}`);
+const server = app.listen(port, () => {
+    console.log(`Server running on port ${port} (max concurrent: ${MAX_CONCURRENT}, queue: ${MAX_QUEUE})`);
 });
-// Keep connection open longer than request timeout so response can be sent
-try {
-    server.timeout = (global as any).timeOut + 30000;
-} catch { }
+try { server.timeout = (global as any).timeOut + 30000; } catch { }
 
+// ============================================================
+// Browser — singleton reutilizado
+// ============================================================
 let browser: any = null;
 
 async function initBrowser() {
     if (browser && browser.isConnected()) return browser;
 
-    try {
-        const { browser: connectedBrowser } = await connect({
-            headless: false,
-            turnstile: true,
-            connectOption: {
-                defaultViewport: { width: 640, height: 480 },
-            },
-            disableXvfb: false,
-            args: [
-                '--window-size=640,480',
-                '--disable-gpu',
-                '--disable-software-rasterizer',
-                '--disable-background-networking',
-                '--disable-default-apps',
-                '--disable-extensions',
-                '--disable-sync',
-                '--disable-translate',
-                '--metrics-recording-only',
-                '--no-first-run',
-                '--disable-background-timer-throttling',
-                '--disable-backgrounding-occluded-windows',
-                '--disable-renderer-backgrounding',
-                '--disable-ipc-flooding-protection',
-                '--disable-hang-monitor',
-                '--disable-popup-blocking',
-                '--disable-prompt-on-repost',
-                '--disable-domain-reliability',
-                '--disable-client-side-phishing-detection',
-                '--disable-component-extensions-with-background-pages',
-                '--no-default-browser-check',
-                '--autoplay-policy=no-user-gesture-required',
-                '--js-flags=--max-old-space-size=128',
-            ],
-        });
+    const { browser: b } = await connect({
+        headless: false,
+        turnstile: true,
+        connectOption: { defaultViewport: { width: 640, height: 480 } },
+        disableXvfb: false,
+        args: [
+            '--window-size=640,480',
+            '--disable-gpu',
+            '--disable-software-rasterizer',
+            '--disable-background-networking',
+            '--disable-default-apps',
+            '--disable-extensions',
+            '--disable-sync',
+            '--disable-translate',
+            '--metrics-recording-only',
+            '--no-first-run',
+            '--disable-background-timer-throttling',
+            '--disable-backgrounding-occluded-windows',
+            '--disable-renderer-backgrounding',
+            '--disable-ipc-flooding-protection',
+            '--disable-hang-monitor',
+            '--disable-popup-blocking',
+            '--disable-prompt-on-repost',
+            '--disable-domain-reliability',
+            '--disable-client-side-phishing-detection',
+            '--disable-component-extensions-with-background-pages',
+            '--no-default-browser-check',
+            '--autoplay-policy=no-user-gesture-required',
+            '--js-flags=--max-old-space-size=128',
+        ],
+    });
 
-        browser = connectedBrowser;
-
-        browser.on('disconnected', () => {
-            console.log('Browser disconnected');
-            browser = null;
-        });
-
-        return browser;
-    } catch (error) {
-        console.error('Failed to initialize browser:', error);
-        throw error;
-    }
+    browser = b;
+    browser.on('disconnected', () => { console.log('Browser disconnected'); browser = null; });
+    return browser;
 }
 
 initBrowser().then(() => console.log("Browser initialized")).catch(err => console.error("Initial browser launch failed", err));
 
-
 async function getPage() {
-    if (!browser || !browser.isConnected()) {
-        await initBrowser();
-    }
+    if (!browser || !browser.isConnected()) await initBrowser();
+    if (!browser) throw new Error("Browser not available");
 
-    if (!browser) {
-        throw new Error("Browser not available");
-    }
-
-    // Usa BrowserContext para isolamento mais leve que abrir page direto
     const context = await browser.createBrowserContext();
     const page = await context.newPage();
+    (page as any)._browserContext = context;
 
-    await page.setViewport({ width: 640, height: 480 });
-
-    // Desabilita cache do browser pra não acumular disco
-    const cdp = await page.createCDPSession();
-    await cdp.send('Network.setCacheDisabled', { cacheDisabled: true });
-    await cdp.detach();
-
-    await page.goto('about:blank');
     await page.setRequestInterception(true);
     page.on('request', async (req: any) => {
         try {
@@ -147,15 +142,35 @@ async function getPage() {
         } catch (_) { }
     });
 
-    // Guarda referência ao context para cleanup
-    (page as any)._browserContext = context;
-
     return page;
 }
+
+async function closePage(page: any) {
+    if (!page) return;
+    try {
+        const ctx = (page as any)._browserContext;
+        if (ctx) await ctx.close();
+        else await page.close();
+    } catch { }
+}
+
+// ============================================================
+// Routes
+// ============================================================
+app.get('/health', (_req: Request, res: Response) => {
+    res.json({
+        status: 'ok',
+        active: activeCount,
+        queued: waitQueue.length,
+        maxConcurrent: MAX_CONCURRENT,
+        browserConnected: !!(browser && browser.isConnected()),
+    });
+});
 
 app.post('/cloudflare', async (req: Request, res: Response): Promise<any> => {
     const startTime = Date.now();
     const data = req.body;
+
     if (!data || typeof data.mode !== 'string') {
         return res.status(400).json({ message: 'Bad Request: missing or invalid mode' });
     }
@@ -163,22 +178,29 @@ app.post('/cloudflare', async (req: Request, res: Response): Promise<any> => {
         return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    if ((global as any).browserLimit <= 0) {
-        return res.status(429).json({ message: 'Too Many Requests' });
-    }
-
-    let cacheKey: string = "", cached;
+    // Cache check antes de adquirir slot
+    let cacheKey = "";
     if (data.mode === "iuam") {
-        cacheKey = JSON.stringify(data);
-        cached = await readCache(cacheKey);
+        cacheKey = `${data.domain}|${data.userAgent || ''}`;
+        const cached = readCache(cacheKey);
         if (cached) {
             return res.status(200).json({ ...cached, cached: true, elapsed: ((Date.now() - startTime) / 1000).toFixed(2) + 's' });
         }
     }
 
-    (global as any).browserLimit--;
+    // Adquire slot com fila
+    try {
+        await acquireSlot();
+    } catch {
+        return res.status(429).json({
+            message: 'Too Many Requests',
+            active: activeCount,
+            queued: waitQueue.length,
+        });
+    }
+
     let result: any;
-    let page;
+    let page: any = null;
     const reqT = Number(data.timeOut);
     const requestTimeout = reqT > 0 ? reqT : (global as any).timeOut;
     const prevTimeOut = (global as any).timeOut;
@@ -201,7 +223,7 @@ app.post('/cloudflare', async (req: Request, res: Response): Promise<any> => {
 
                 if (!result.code || result.code === 200) {
                     const ttl = Number(data.ttl || data.expire) || CACHE_TTL;
-                    await writeCache(cacheKey, result, ttl);
+                    writeCache(cacheKey, result, ttl);
                 }
                 break;
 
@@ -212,18 +234,8 @@ app.post('/cloudflare', async (req: Request, res: Response): Promise<any> => {
         result = { code: 500, message: err.message };
     } finally {
         (global as any).timeOut = prevTimeOut;
-        if (page) {
-            try {
-                // Fecha o BrowserContext inteiro (libera todos os recursos da page)
-                const ctx = (page as any)._browserContext;
-                if (ctx) {
-                    await ctx.close();
-                } else {
-                    await page.close();
-                }
-            } catch { }
-        }
-        (global as any).browserLimit++;
+        await closePage(page);
+        releaseSlot();
     }
 
     if (!result.elapsed) {
@@ -232,7 +244,7 @@ app.post('/cloudflare', async (req: Request, res: Response): Promise<any> => {
     res.status(result.code ?? 200).json(result);
 });
 
-app.use(async (req: Request, res: Response) => {
+app.use((_req: Request, res: Response) => {
     res.status(404).json({ message: 'Not Found' });
 });
 
