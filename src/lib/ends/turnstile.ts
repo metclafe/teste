@@ -4,34 +4,34 @@ const path = require('path');
 interface TurnstileData {
     domain: string;
     siteKey: string;
+    userAgent?: string;
     proxy?: {
         username?: string;
         password?: string;
     };
 }
 
-async function turnstile({ domain, proxy, siteKey }: TurnstileData, page: any) {
+const MIN_TOKEN_LEN = 30;
+
+async function turnstile({ domain, proxy, siteKey, userAgent }: TurnstileData, page: any) {
     if (!domain) throw new Error("Missing domain parameter");
     if (!siteKey) throw new Error("Missing siteKey parameter");
 
-    const timeout = (global as any).timeOut || 60000;
-    let isResolved = false;
+    const timeout = (global as any).timeOut || 180000;
 
-    const cl = setTimeout(async () => {
-        if (!isResolved) {
-            throw new Error("Timeout Error");
-        }
-    }, timeout);
+    // Seta o user-agent do cliente pra o token ser gerado com o mesmo fingerprint
+    if (userAgent) {
+        await page.setUserAgent(userAgent);
+    }
 
-    try {
-        if (proxy?.username && proxy?.password) {
-            await page.authenticate({
-                username: proxy.username,
-                password: proxy.password,
-            });
-        }
+    if (proxy?.username && proxy?.password) {
+        await page.authenticate({
+            username: proxy.username,
+            password: proxy.password,
+        });
+    }
 
-        const htmlContent = `
+    const htmlContent = `
         <div class="turnstile"></div>
         <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?onload=onloadTurnstileCallback" defer></script>
         <script>
@@ -50,9 +50,10 @@ async function turnstile({ domain, proxy, siteKey }: TurnstileData, page: any) {
         </script>
     `;
 
-        await page.setRequestInterception(true);
-        page.removeAllListeners("request");
-        page.on("request", async (request: any) => {
+    await page.setRequestInterception(true);
+    page.removeAllListeners("request");
+    page.on("request", async (request: any) => {
+        try {
             const reqUrl = request.url();
             if ([domain, domain + "/"].includes(reqUrl) && request.resourceType() === "document") {
                 await request.respond({
@@ -83,29 +84,64 @@ async function turnstile({ domain, proxy, siteKey }: TurnstileData, page: any) {
             } else {
                 await request.abort();
             }
-        });
+        } catch (_) { }
+    });
 
-        await page.goto(domain, { waitUntil: "domcontentloaded" });
+    await page.goto(domain, { waitUntil: "domcontentloaded" });
 
+    // Usa exposeFunction pra capturar o token instantaneamente via callback
+    // ao invés de polling que pode perder o momento exato
+    const token = await Promise.race([
+        waitForTokenViaCallback(page, timeout),
+        waitForTokenViaPolling(page, timeout),
+    ]);
+
+    if (!token || token.length < MIN_TOKEN_LEN) {
+        throw new Error("Failed to get valid turnstile token");
+    }
+
+    return token;
+}
+
+/**
+ * Aguarda o token aparecer no DOM via polling.
+ * Fallback caso o callback não funcione.
+ */
+async function waitForTokenViaPolling(page: any, timeout: number): Promise<string | null> {
+    try {
         await page.waitForSelector('[name="cf-response"]', { timeout });
-
         const token = await page.evaluate(() => {
-            try {
-                return document.querySelector('[name="cf-response"]')?.getAttribute('value');
-            } catch {
-                return null;
-            }
+            const el = document.querySelector('[name="cf-response"]');
+            return el ? el.getAttribute('value') : null;
         });
-
-        isResolved = true;
-        clearTimeout(cl);
-
-        if (!token || token.length < 10) throw new Error("Failed to get token");
         return token;
+    } catch {
+        return null;
+    }
+}
 
-    } catch (e) {
-        clearTimeout(cl);
-        throw e;
+/**
+ * Aguarda o token via waitForFunction — resolve assim que o valor
+ * aparece no DOM, sem delay de polling.
+ */
+async function waitForTokenViaCallback(page: any, timeout: number): Promise<string | null> {
+    try {
+        await page.waitForFunction(
+            () => {
+                const el = document.querySelector('[name="cf-response"]');
+                if (!el) return false;
+                const val = el.getAttribute('value');
+                return val && val.length > 30;
+            },
+            { timeout, polling: 200 }
+        );
+        const token = await page.evaluate(() => {
+            const el = document.querySelector('[name="cf-response"]');
+            return el ? el.getAttribute('value') : null;
+        });
+        return token;
+    } catch {
+        return null;
     }
 }
 

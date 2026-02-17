@@ -179,7 +179,7 @@ export async function connect({
         try {
             xvfbsession = new Xvfb({
                 silent: true,
-                xvfb_args: ["-screen", "0", "1920x1080x24", "-ac"],
+                xvfb_args: ["-screen", "0", "800x600x24", "-ac"],
             });
             xvfbsession.startSync();
         } catch (err: any) {
@@ -229,6 +229,9 @@ export async function connect({
         ...customConfig,
     });
 
+    // Aguarda o Chrome estabilizar a porta de debug (Windows é mais lento)
+    await new Promise(r => setTimeout(r, 1000));
+
     if (plugins && plugins.length > 0) {
         const { addExtra } = await import("puppeteer-extra");
 
@@ -239,10 +242,23 @@ export async function connect({
         }
     }
 
-    const browser = await puppeteer.connect({
-        browserURL: `http://127.0.0.1:${chrome.port}`,
-        ...connectOption,
-    });
+    let browser: Browser | null = null;
+    const maxConnectRetries = 3;
+    for (let i = 0; i < maxConnectRetries; i++) {
+        try {
+            browser = await puppeteer.connect({
+                browserURL: `http://127.0.0.1:${chrome.port}`,
+                ...connectOption,
+            });
+            break;
+        } catch (err) {
+            if (i === maxConnectRetries - 1) throw err;
+            console.warn(`Browser connect attempt ${i + 1} failed, retrying in 1s...`);
+            await new Promise(r => setTimeout(r, 1000));
+        }
+    }
+
+    if (!browser) throw new Error("Failed to connect to browser");
 
     let [page] = await browser.pages();
 

@@ -8,7 +8,8 @@ const port = process.env.PORT || 8742;
 const authToken = process.env.authToken || null;
 
 (global as any).browserLimit = Number(process.env.browserLimit) || 20;
-(global as any).timeOut = Number(process.env.timeOut) || 60000;
+// 3 min default so captcha has time to resolve; use env timeOut or request body timeOut to override
+(global as any).timeOut = Number(process.env.timeOut) || 180000;
 
 const CACHE_TTL = 30 * 60 * 1000;
 
@@ -35,29 +36,65 @@ async function writeCache(key: string, value: any, ttl: number = CACHE_TTL) {
     memoryCache[key] = { expireAt: Date.now() + ttl, value };
 }
 
+// Limpa entradas expiradas a cada 5 min para não vazar memória
+setInterval(() => {
+    const now = Date.now();
+    for (const key in memoryCache) {
+        if (memoryCache[key].expireAt <= now) {
+            delete memoryCache[key];
+        }
+    }
+}, 5 * 60 * 1000);
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-if (process.env.NODE_ENV !== 'development') {
-    let server = app.listen(port, async () => {
-        console.log(`Server running on port ${port}`);
-    });
-    try {
-        server.timeout = (global as any).timeOut;
-    } catch { }
-}
+let server = app.listen(port, async () => {
+    console.log(`Server running on port ${port}`);
+});
+// Keep connection open longer than request timeout so response can be sent
+try {
+    server.timeout = (global as any).timeOut + 30000;
+} catch { }
 
 let browser: any = null;
 
 async function initBrowser() {
-    if (browser) return browser;
+    if (browser && browser.isConnected()) return browser;
 
     try {
         const { browser: connectedBrowser } = await connect({
             headless: false,
             turnstile: true,
-            connectOption: { defaultViewport: null },
+            connectOption: {
+                defaultViewport: { width: 640, height: 480 },
+            },
             disableXvfb: false,
+            args: [
+                '--window-size=640,480',
+                '--disable-gpu',
+                '--disable-software-rasterizer',
+                '--disable-background-networking',
+                '--disable-default-apps',
+                '--disable-extensions',
+                '--disable-sync',
+                '--disable-translate',
+                '--metrics-recording-only',
+                '--no-first-run',
+                '--disable-background-timer-throttling',
+                '--disable-backgrounding-occluded-windows',
+                '--disable-renderer-backgrounding',
+                '--disable-ipc-flooding-protection',
+                '--disable-hang-monitor',
+                '--disable-popup-blocking',
+                '--disable-prompt-on-repost',
+                '--disable-domain-reliability',
+                '--disable-client-side-phishing-detection',
+                '--disable-component-extensions-with-background-pages',
+                '--no-default-browser-check',
+                '--autoplay-policy=no-user-gesture-required',
+                '--js-flags=--max-old-space-size=128',
+            ],
         });
 
         browser = connectedBrowser;
@@ -86,18 +123,32 @@ async function getPage() {
         throw new Error("Browser not available");
     }
 
-    const page = await browser.newPage();
+    // Usa BrowserContext para isolamento mais leve que abrir page direto
+    const context = await browser.createBrowserContext();
+    const page = await context.newPage();
+
+    await page.setViewport({ width: 640, height: 480 });
+
+    // Desabilita cache do browser pra não acumular disco
+    const cdp = await page.createCDPSession();
+    await cdp.send('Network.setCacheDisabled', { cacheDisabled: true });
+    await cdp.detach();
 
     await page.goto('about:blank');
     await page.setRequestInterception(true);
     page.on('request', async (req: any) => {
-        const type = req.resourceType();
-        if (["image", "stylesheet", "font", "media"].includes(type)) {
-            await req.abort();
-        } else {
-            await req.continue();
-        }
+        try {
+            const type = req.resourceType();
+            if (["image", "stylesheet", "font", "media"].includes(type)) {
+                await req.abort();
+            } else {
+                await req.continue();
+            }
+        } catch (_) { }
     });
+
+    // Guarda referência ao context para cleanup
+    (page as any)._browserContext = context;
 
     return page;
 }
@@ -128,6 +179,10 @@ app.post('/cloudflare', async (req: Request, res: Response): Promise<any> => {
     (global as any).browserLimit--;
     let result: any;
     let page;
+    const reqT = Number(data.timeOut);
+    const requestTimeout = reqT > 0 ? reqT : (global as any).timeOut;
+    const prevTimeOut = (global as any).timeOut;
+    (global as any).timeOut = requestTimeout;
 
     try {
         page = await getPage();
@@ -156,8 +211,17 @@ app.post('/cloudflare', async (req: Request, res: Response): Promise<any> => {
     } catch (err: any) {
         result = { code: 500, message: err.message };
     } finally {
+        (global as any).timeOut = prevTimeOut;
         if (page) {
-            try { await page.close(); } catch { }
+            try {
+                // Fecha o BrowserContext inteiro (libera todos os recursos da page)
+                const ctx = (page as any)._browserContext;
+                if (ctx) {
+                    await ctx.close();
+                } else {
+                    await page.close();
+                }
+            } catch { }
         }
         (global as any).browserLimit++;
     }
